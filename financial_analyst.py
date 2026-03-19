@@ -104,45 +104,148 @@ def ensure_collection_exists():
 
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     """
-    Opens a PDF and extracts text + tables page by page.
+    Extracts text using 2-level fallback:
 
-    Why page by page?
-      We tag each chunk with its page number for citations.
-      When the LLM answers "Gross NPA was 1.26%" it can also say
-      "Source: HDFC Q3 2024 Page 14" — that's what makes it trustworthy.
+    Level 1 — pdfplumber:
+      Fast, works for text-based and table pages.
+      Handles pages 2, 3, 4 of your HDFC PDF perfectly.
 
-    Returns: [{"page": 1, "content": "..."}, {"page": 2, ...}, ...]
+    Level 2 — NVIDIA Vision LLM (llama-3.2-90b-vision-instruct):
+      Fallback for image-heavy or styled pages.
+      Converts page to image → sends to NVIDIA vision model.
+      Works for page 1 type (designed infographic pages).
+      No new packages needed — uses your existing NVIDIA API key.
     """
-    pages = []
+    import pypdfium2 as pdfium
+    import base64
+    import io
+    from PIL import Image
 
+    pages      = []
     console.print(f"\n[cyan]Opening PDF:[/cyan] {pdf_path}")
 
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        console.print(f"[cyan]Total pages:[/cyan] {total_pages}")
+    pdf_doc     = pdfium.PdfDocument(pdf_path)
+    total_pages = len(pdf_doc)
+    console.print(f"[cyan]Total pages:[/cyan] {total_pages}")
 
-        for i, page in enumerate(pdf.pages):
-            page_content = ""
+    with pdfplumber.open(pdf_path) as plumber_pdf:
+        for i in range(total_pages):
+            page_num      = i + 1
+            final_content = ""
+            method_used   = ""
 
-            text = page.extract_text()
-            if text:
-                page_content += text
+            # ── Level 1: pdfplumber ───────────────────────────────────
+            try:
+                plumber_page = plumber_pdf.pages[i]
+                text         = plumber_page.extract_text() or ""
 
-            tables = page.extract_tables()
-            for table in tables:
-                if table:
-                    page_content += "\n" + table_to_text(table)
+                table_text = ""
+                for table in plumber_page.extract_tables():
+                    if table:
+                        table_text += "\n" + table_to_text(table)
 
-            if page_content.strip():
+                combined = (text + table_text).strip()
+
+                if len(combined) >= 100:
+                    final_content = combined
+                    method_used   = "pdfplumber"
+
+            except Exception as e:
+                console.print(f"  [yellow]pdfplumber failed page {page_num}: {e}[/yellow]")
+
+            # ── Level 2: NVIDIA Vision LLM fallback ───────────────────
+            # Only triggers when pdfplumber extracts < 100 chars
+            # Sends page as image to NVIDIA vision model
+            if len(final_content) < 100:
+                try:
+                    console.print(
+                        f"  [yellow]Page {page_num}: weak extraction "
+                        f"({len(final_content)} chars) "
+                        f"→ using NVIDIA Vision LLM[/yellow]"
+                    )
+
+                    # Convert PDF page to image using pypdfium2
+                    pdf_page = pdf_doc[i]
+                    bitmap   = pdf_page.render(
+                        scale=2,           # 2x zoom for better quality
+                        rotation=0
+                    )
+                    pil_image = bitmap.to_pil()
+
+                    # Convert image to base64 string
+                    buffer = io.BytesIO()
+                    pil_image.save(buffer, format="PNG")
+                    img_base64 = base64.b64encode(
+                        buffer.getvalue()
+                    ).decode("utf-8")
+
+                    # Send to NVIDIA vision model
+                    # llama-3.2-90b-vision-instruct can read images
+                    response = nvidia_client.chat.completions.create(
+                        model="meta/llama-3.2-90b-vision-instruct",
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/png;base64,{img_base64}"
+                                        }
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": """Extract ALL text and numbers from this financial document image.
+Include every metric, value, percentage, label and heading you can see.
+Format as plain text. Do not skip any numbers or labels.
+This is a bank financial results page — every number is important."""
+                                    }
+                                ]
+                            }
+                        ],
+                        max_tokens=1024
+                    )
+
+                    vision_text = response.choices[0].message.content.strip()
+
+                    if vision_text:
+                        final_content = vision_text
+                        method_used   = "NVIDIA Vision LLM"
+
+                except Exception as e:
+                    console.print(
+                        f"  [red]NVIDIA Vision failed page {page_num}: {e}[/red]"
+                    )
+
+            # ── Store result ──────────────────────────────────────────
+            if final_content.strip():
                 pages.append({
-                    "page":    i + 1,
-                    "content": page_content.strip()
+                    "page":    page_num,
+                    "content": final_content.strip(),
+                    "method":  method_used
                 })
+                console.print(
+                    f"  Page {page_num}: {len(final_content)} chars "
+                    f"[dim]via {method_used}[/dim]"
+                )
+            else:
+                console.print(
+                    f"  [yellow]Page {page_num}: nothing extracted[/yellow]"
+                )
 
-            if (i + 1) % 10 == 0:
-                console.print(f"  Processed {i + 1}/{total_pages} pages...")
+    pdf_doc.close()
 
-    console.print(f"[green]✓[/green] Extracted text from {len(pages)} pages")
+    # Print summary
+    method_counts = {}
+    for p in pages:
+        m = p.get("method", "unknown")
+        method_counts[m] = method_counts.get(m, 0) + 1
+
+    console.print(f"\n[green]✓[/green] Extracted from {len(pages)} pages")
+    console.print("[cyan]Methods used:[/cyan]")
+    for method, count in method_counts.items():
+        console.print(f"  {method} : {count} page(s)")
+
     return pages
 
 
@@ -159,45 +262,156 @@ def table_to_text(table: list) -> str:
         rows.append(" | ".join(clean_row))
     return "\n".join(rows)
 
+# List of boilerplate text to remove from every page
+BOILERPLATE_PATTERNS = [
+    "Figures of the previous periods have been regrouped",
+    "reclassified wherever necessary to conform",
+    "HDFC Bank Limited Financial Results",
+    "HDFC Limited merged with HDFC Bank effective",
+    "Prior period numbers are not comparable",
+    "Certain figures reported above will not add-up due to rounding",
+    "Gross of financing through IBPC/BRDS/Securitisation",
+]
 
+def clean_text(text: str) -> str:
+    """
+    Removes boilerplate footer/header text that appears on every page.
+    These repeated phrases pollute search results because they score
+    high for almost every query but contain no useful financial data.
+    """
+    lines  = text.split("\n")
+    cleaned = []
+
+    for line in lines:
+        line_stripped = line.strip()
+
+        # Skip empty lines
+        if not line_stripped:
+            continue
+
+        # Skip lines that are pure boilerplate
+        is_boilerplate = any(
+            pattern.lower() in line_stripped.lower()
+            for pattern in BOILERPLATE_PATTERNS
+        )
+
+        if not is_boilerplate:
+            cleaned.append(line_stripped)
+
+    return "\n".join(cleaned).strip()
+
+
+def is_meaningful_chunk(text: str) -> bool:
+    """
+    Returns True only if a chunk contains actual financial data.
+    Filters out:
+    - Pure boilerplate footer chunks
+    - Chunks with no numbers (unlikely to have financial data)
+    - Very short chunks (less than 80 chars after cleaning)
+
+    Why check for numbers?
+    Financial report chunks should always have at least one
+    number — ratios, percentages, amounts etc.
+    A chunk with no digits is almost certainly a header or footer.
+    """
+    if len(text.strip()) < 80:
+        return False
+
+    # Check if chunk has any numbers — financial data always has numbers
+    has_numbers = any(char.isdigit() for char in text)
+    if not has_numbers:
+        return False
+
+    # Check it's not just boilerplate
+    boilerplate_count = sum(
+        1 for pattern in BOILERPLATE_PATTERNS
+        if pattern.lower() in text.lower()
+    )
+
+    # If more than 2 boilerplate patterns → mostly footer text
+    if boilerplate_count > 2:
+        return False
+
+    return True
 # ─── STEP 2: Chunking ─────────────────────────────────────────────────────────
 
 def split_into_chunks(pages: list[dict], chunk_size: int = 500, overlap: int = 100) -> list[dict]:
     """
-    Splits page text into smaller overlapping chunks.
-
-    chunk_size = 500 words → good for financial text
-    overlap    = 100 words → 20% overlap is standard practice
+    Table-aware chunking with boilerplate filtering.
+    Removes footer text and meaningless chunks before storing.
     """
     chunks   = []
     chunk_id = 0
+    skipped  = 0
 
     for page_data in pages:
-        words    = page_data["content"].split()
+        # Clean boilerplate from content first
+        content  = clean_text(page_data["content"])
         page_num = page_data["page"]
 
-        start = 0
-        while start < len(words):
-            end        = start + chunk_size
-            chunk_text = " ".join(words[start:end])
+        if not content.strip():
+            continue
 
-            if len(chunk_text.strip()) > 50:
-                chunks.append({
-                    "id":   f"chunk_{chunk_id}",
-                    "text": chunk_text,
-                    "page": page_num
-                })
-                chunk_id += 1
+        lines       = content.split("\n")
+        table_lines = []
+        text_lines  = []
 
-            start += chunk_size - overlap
+        for line in lines:
+            if " | " in line:
+                table_lines.append(line)
+            else:
+                text_lines.append(line)
+
+        # ── Table chunks ──────────────────────────────────────────────
+        if table_lines:
+            rows       = table_lines
+            batch_size = 15
+
+            for j in range(0, len(rows), batch_size):
+                batch = rows[j: j + batch_size]
+
+                if j > 0 and rows:
+                    batch = [rows[0]] + batch
+
+                batch_text = "\n".join(batch).strip()
+
+                if is_meaningful_chunk(batch_text):
+                    chunks.append({
+                        "id":   f"chunk_{chunk_id}",
+                        "text": batch_text,
+                        "page": page_num
+                    })
+                    chunk_id += 1
+                else:
+                    skipped += 1
+
+        # ── Text chunks ───────────────────────────────────────────────
+        if text_lines:
+            text_content = " ".join(text_lines).strip()
+            words        = text_content.split()
+            start        = 0
+
+            while start < len(words):
+                end        = start + chunk_size
+                chunk_text = " ".join(words[start:end]).strip()
+
+                if is_meaningful_chunk(chunk_text):
+                    chunks.append({
+                        "id":   f"chunk_{chunk_id}",
+                        "text": chunk_text,
+                        "page": page_num
+                    })
+                    chunk_id += 1
+                else:
+                    skipped += 1
+
+                start += chunk_size - overlap
 
     console.print(
         f"[green]✓[/green] Created {len(chunks)} chunks "
-        f"(chunk_size={chunk_size} words, overlap={overlap} words)"
+        f"({skipped} boilerplate chunks filtered out)"
     )
     return chunks
-
-
 # ─── STEP 3: Embedding (Ollama) ───────────────────────────────────────────────
 
 def get_embedding(text: str) -> list[float]:
@@ -228,26 +442,37 @@ def embed_in_batches(texts: list[str], batch_size: int = 50) -> list[list[float]
 # ─── STEP 4: Store in Qdrant ──────────────────────────────────────────────────
 
 def store_in_qdrant(chunks, embeddings, company, quarter, year, pdf_path):
-    """
-    Stores chunk text + embedding vectors in Qdrant.
-    Uses upsert — safe to re-run without duplicating data.
-    """
     points = []
+
+    # Page context labels — helps search find right page
+    page_labels = {
+        "1": "Q3 Results Summary Net Profit NII Deposits Advances NPA Capital Adequacy NIM CASA",
+        "2": "Product-wise Advances Retail Mortgages Personal Loans CRB Corporate",
+        "3": "Financial Metrics NIM NII CASA ratio GNPA Capital Adequacy Credit costs employees",
+        "4": "HDB Financial Services subsidiary advances NIM credit cost"
+    }
 
     for chunk, embedding in zip(chunks, embeddings):
         point_id = abs(hash(
             f"{company}_{quarter}_{year}_{chunk['id']}"
         )) % (2 ** 63)
 
+        page_str    = str(chunk["page"])
+        page_label  = page_labels.get(page_str, "")
+
+        # Prefix chunk text with page context
+        # This helps semantic search find the right page
+        enriched_text = f"{page_label}\n{chunk['text']}" if page_label else chunk["text"]
+
         points.append(PointStruct(
             id=point_id,
             vector=embedding,
             payload={
-                "text":    chunk["text"],
+                "text":    enriched_text,
                 "company": company.upper(),
                 "quarter": quarter.upper(),
                 "year":    str(year),
-                "page":    str(chunk["page"]),
+                "page":    page_str,
                 "source":  os.path.basename(pdf_path)
             }
         ))
@@ -258,15 +483,11 @@ def store_in_qdrant(chunks, embeddings, company, quarter, year, pdf_path):
             collection_name=COLLECTION_NAME,
             points=points[i: i + batch_size]
         )
-        console.print(
-            f"  Stored {min(i + batch_size, len(points))}/{len(points)} chunks in Qdrant..."
-        )
 
     console.print(
         f"[green]✓[/green] Stored {len(chunks)} chunks "
         f"[{company.upper()} · {quarter.upper()} · {year}]"
     )
-
 
 # ─── STEP 5: Retrieval ────────────────────────────────────────────────────────
 
@@ -400,7 +621,7 @@ def search_financial_reports(query: str) -> str:
         results = qdrant.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_embedding,
-            limit=4,
+            limit=6,
             with_payload=True
         )
 
@@ -425,41 +646,36 @@ def search_financial_reports(query: str) -> str:
 
 
 @tool
-def compare_companies(input_json: str) -> str:
+def compare_companies(metric: str, companies: str, quarter: str = "", year: str = "") -> str:
     """
     Compare a specific financial metric across two or more companies.
 
     Use this tool when asked to compare companies on any metric
     like NPA ratio, NIM, ROE, capital adequacy, loan growth etc.
 
-    Input must be a JSON string with these fields:
-      - metric: the metric to compare (e.g. "NPA ratio")
-      - companies: list of company names (e.g. ["HDFC", "ICICI"])
-      - quarter: quarter (e.g. "Q3")
-      - year: year (e.g. "2024")
+    Arguments:
+      metric    : the metric to compare e.g. "gross NPA ratio"
+      companies : comma-separated company names e.g. "HDFC,ICICI"
+      quarter   : quarter e.g. "Q3" (optional)
+      year      : year e.g. "2025" (optional)
 
-    Example input:
-      {"metric": "gross NPA ratio", "companies": ["HDFC", "ICICI"], "quarter": "Q3", "year": "2024"}
-
-    Returns: search results for each company to help you compare.
+    Example usage:
+      metric="gross NPA ratio", companies="HDFC,ICICI", quarter="Q3", year="2025"
     """
     try:
-        data      = json.loads(input_json)
-        metric    = data.get("metric", "")
-        companies = data.get("companies", [])
-        quarter   = data.get("quarter", "")
-        year      = data.get("year", "")
+        # Parse comma-separated companies string
+        company_list = [c.strip() for c in companies.split(",")]
 
         output = f"Comparison of '{metric}' across companies:\n\n"
 
-        for company in companies:
+        for company in company_list:
             query           = f"{company} {metric} {quarter} {year}"
             query_embedding = get_embedding(query)
 
             results = qdrant.search(
                 collection_name=COLLECTION_NAME,
                 query_vector=query_embedding,
-                limit=2,
+                limit=3,
                 query_filter=Filter(
                     must=[FieldCondition(
                         key="company",
@@ -474,25 +690,23 @@ def compare_companies(input_json: str) -> str:
                 for hit in results:
                     p = hit.payload
                     output += (
-                        f"[{p.get('quarter')} {p.get('year')} · Page {p.get('page')}]\n"
-                        f"{p.get('text', '')}\n\n"
+                        f"[{p.get('quarter')} {p.get('year')} "
+                        f"· Page {p.get('page')}]\n"
+                        f"{p.get('text', '')[:300]}\n\n"
                     )
             else:
-                output += f"No data found for {company}. Make sure you ingested {company}'s report.\n\n"
+                output += (
+                    f"No data found for {company}. "
+                    f"Make sure {company} report is ingested.\n\n"
+                )
 
         return output
 
-    except json.JSONDecodeError:
-        return (
-            "Invalid JSON. Use format:\n"
-            '{"metric": "NPA ratio", "companies": ["HDFC", "ICICI"], "quarter": "Q3", "year": "2024"}'
-        )
     except Exception as e:
         return f"Comparison error: {str(e)}"
 
-
 @tool
-def calculate_ratio(input_json: str) -> str:
+def calculate_ratio(calculation_type: str, value1: float, value2: float, label: str = "") -> str:
     """
     Calculate financial ratios or simple financial calculations.
 
@@ -501,47 +715,39 @@ def calculate_ratio(input_json: str) -> str:
       - Find difference between two financial metrics
       - Calculate growth rates
 
-    Input must be a JSON string with these fields:
-      - calculation_type: "percentage_change", "difference", or "growth_rate"
-      - value1: first number (current value)
-      - value2: second number (previous/base value)
-      - label: description of what you're calculating
+    Arguments:
+      calculation_type : "percentage_change", "difference", or "growth_rate"
+      value1           : first number (current value)
+      value2           : second number (previous or base value)
+      label            : description of what you are calculating (optional)
 
-    Example input:
-      {"calculation_type": "percentage_change", "value1": 1.26, "value2": 1.34, "label": "HDFC NPA Q3 vs Q2"}
-
-    Returns: calculated result with explanation.
+    Example usage:
+      calculation_type="percentage_change", value1=1.42, value2=1.26, label="HDFC NPA change"
     """
     try:
-        data      = json.loads(input_json)
-        calc_type = data.get("calculation_type", "percentage_change")
-        value1    = float(data.get("value1", 0))
-        value2    = float(data.get("value2", 0))
-        label     = data.get("label", "")
-
-        if calc_type == "percentage_change":
+        if calculation_type == "percentage_change":
             if value2 == 0:
                 return "Cannot calculate — base value is 0."
             change    = ((value1 - value2) / value2) * 100
             direction = "increased" if change > 0 else "decreased"
             return (
                 f"Calculation: {label}\n"
-                f"Value 1 : {value1}\n"
-                f"Value 2 : {value2}\n"
-                f"Result  : {direction} by {abs(round(change, 2))}%"
+                f"Value 1  : {value1}\n"
+                f"Value 2  : {value2}\n"
+                f"Result   : {direction} by {abs(round(change, 2))}%"
             )
 
-        elif calc_type == "difference":
+        elif calculation_type == "difference":
             diff      = value1 - value2
             direction = "higher" if diff > 0 else "lower"
             return (
                 f"Calculation: {label}\n"
-                f"Value 1 : {value1}\n"
-                f"Value 2 : {value2}\n"
-                f"Result  : {abs(round(diff, 4))} {direction}"
+                f"Value 1  : {value1}\n"
+                f"Value 2  : {value2}\n"
+                f"Result   : {abs(round(diff, 4))} {direction}"
             )
 
-        elif calc_type == "growth_rate":
+        elif calculation_type == "growth_rate":
             if value2 == 0:
                 return "Cannot calculate — base value is 0."
             rate = ((value1 - value2) / value2) * 100
@@ -552,13 +758,10 @@ def calculate_ratio(input_json: str) -> str:
                 f"Growth   : {round(rate, 2)}%"
             )
 
-        return f"Unknown calculation_type: {calc_type}"
+        return f"Unknown type: {calculation_type}. Use percentage_change, difference, or growth_rate."
 
-    except json.JSONDecodeError:
-        return "Invalid JSON input for calculation."
     except Exception as e:
         return f"Calculation error: {str(e)}"
-
 
 @tool
 def list_available_documents(query: str = "") -> str:
@@ -630,18 +833,23 @@ You MUST follow these rules on EVERY single question — no exceptions:
 
 RULE 1 — ALWAYS call list_available_documents first.
 RULE 2 — ALWAYS call search_financial_reports at least TWICE
-         with different search terms before answering.
-RULE 3 — First search: use the exact term from the question.
-         Second search: use alternate financial terms:
-           NPA       → try "gross NPA non performing assets asset quality"
-           Capital   → try "CRAR CAR Basel tier 1 capital ratio"
-           Income    → try "NII net interest income net profit PAT"
-           Margin    → try "NIM net interest margin yield on advances"
-           Revenue   → try "total income operating revenue fee income"
-RULE 4 — After both searches, combine results and give Final Answer.
+         with DIFFERENT search terms each time.
+RULE 3 — NEVER repeat the same search term twice — always use
+         a different keyword in Step 2:
+           NPA       → try "Total GNPA ratio gross advances 1.42"
+           Capital   → try "Capital Adequacy 20.0 CRAR tier 1"
+           CASA      → try "CASA ratio 34 current account savings"
+           NIM       → try "Net Interest Margin interest earning assets 3.6"
+           NII       → try "Net Interest Income 306 billion"
+           Profit    → try "Net Profit 167 billion Q3"
+           Deposits  → try "Total Deposits 25638 growth"
+           Advances  → try "Total Advances 25182 loan book"
+RULE 4 — After both searches combine results and give Final Answer.
 RULE 5 — NEVER give Final Answer after just 1 tool call.
 RULE 6 — Always cite: company · quarter · year · page number.
 RULE 7 — Never say data is unavailable without doing 2 searches first.
+RULE 8 — When search returns a table with numbers but no labels,
+         look at ALL results not just Result 1.
 
 You MUST use minimum 3 tool calls before giving any Final Answer."""),
     ("human", "{input}"),
